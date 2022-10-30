@@ -279,7 +279,8 @@ func (this *Battle) Tick(delta float32) {
 
 func (this Battle*)BattleEnd(bWin bool)
 {
-	// framedatarecord format |4byte:mapid|1byte:playernum|4byte:playerid1|4byte:playerid2|...|1byte:win|2byte:frameDataCount|1byte:player1framedata|1byate:player2framedata|...
+	// framedatarecord format |4byte:mapid|1byte:playernum|4byte:playerid1|4byte:playerid2|...
+	// |1byte:win|2byte:frameDataCount|1byte:player1framedata|1byate:player2framedata|...
 	frameDataHead := make([]byte, 0)
 	frameDataHead = WriteInt32(frameDataHead, this.mapId)
 	frameDataHead = WriteByte(frameDataHead, (byte)clientNum)
@@ -299,6 +300,14 @@ func (this Battle*)BattleEnd(bWin bool)
 	this.battleEnd = 1
 }
 
+////////////////////////////
+// server
+////////////////////////////
+type Server struct {
+	lobby Lobby*
+	rooms []Room*
+	battles []Battle*
+}
 
 ////////////////////////////
 // main
