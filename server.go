@@ -4,6 +4,7 @@ import (
 	"math"
 	"fmt"
 	"net/http"
+	"io/ioutil"
 	"time"
 	"github.com/gorilla/websocket"
 )
@@ -12,7 +13,7 @@ import (
 // main
 ////////////////////////////
 func main() {
-	GetServerInstace().Start()
+	GetServerInstance().Start()
 }
 
 ////////////////////////////
@@ -31,8 +32,8 @@ type Server struct {
 	upgrader websocket.Upgrader
 }
 
-var serverInstance Server*
-func GetServerInstace() *Server {
+var serverInstance *Server
+func GetServerInstance() *Server {
 	if serverInstance == nil {
 		serverInstance = &Server{}
 		serverInstance.Init()
@@ -44,13 +45,13 @@ func (s *Server)Init() {
 
 	s.lobby = &Lobby{}
 	s.lobby.Init()
-	s.rooms = make(map[uint32]*Room, 0)
-	s.battles = make(map[uint32]*Battle, 0)
+	s.rooms = make(map[uint32]*Room)
+	s.battles = make(map[uint32]*Battle)
 	s.maxRoomId = 0
 	s.maxBattleId = 0
 
-	s.playersNoLogin = make([]*Player, 0)
-	s.newPlayerChan = make(chan Client*, 1024)
+	s.playersNoLogin = make([]*Player, 0, 128)
+	s.newPlayerChan = make(chan *Player)
 
 	s.upgrader = websocket.Upgrader {
 		ReadBufferSize: 1024,
@@ -59,14 +60,15 @@ func (s *Server)Init() {
 }
 
 func (s *Server)Start() {
-	go s.TickCoroutin()
+	go s.TickCoroutine()
 
 	http.HandleFunc("/", s.HandleNewConnection)
+	fmt.Println("server started, listening 127.0.0.1:30000...")
 	http.ListenAndServe("127.0.0.1:30000", nil)
 }
 
 func (s *Server)HandleNewConnection(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		fmt.Println("upgrade error", err)
 		return
@@ -80,33 +82,37 @@ func (s *Server)HandleNewConnection(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server)TickCoroutine() {
 
-	tickInterval = 0.1
-	lastTickTime := time.Now().UnixMilli() * 0.001
+	// here all the time are Millisecond 
+	firstTick := true
+	var tickInterval int64 = 100
+	lastTickTime := time.Now().UnixMilli()
 
 	for {
 		// delta time
-		tickStartTime := time.UnixMilli() * 0.001
+		tickStartTime := time.Now().UnixMilli()
 		deltaTime := tickStartTime - lastTickTime
 		lastTickTime = tickStartTime
-		deltaTime = deltaTime < 0.01 ? tickInterval : deltaTime
+		if firstTick {
+			deltaTime = tickInterval
+			firstTick = false
+		}
 
 		// tick
-		s.Tick(deltaTime)
-		if s.lobby != nil: {
-			s.lobby.Tick(deltaTime)
-		}
+		deltaTimeSecond := float32(deltaTime) * 0.001
+		s.Tick(deltaTimeSecond)
+		s.lobby.Tick(deltaTimeSecond)
 		for _, v := range s.rooms {
-			v.Tick(deltaTime)
+			v.Tick(deltaTimeSecond)
 		}
 		for _, v := range s.battles {
-			v.Tick(deltaTime)
+			v.Tick(deltaTimeSecond)
 		}
 
-		// make (tick code timecost + sleep) == tickInterval
-		tickEndTime := time.Now().UnixMilli() * 0.001
+		// sleepTime + codeCostTime == tickInterval
+		tickEndTime := time.Now().UnixMilli()
 		sleepTime := tickInterval - (tickEndTime - tickStartTime)
 		if sleepTime > 0 {
-			time.Sleep((int)(sleepTime * 1000) * time.Millisecond)
+			time.Sleep(time.Duration(sleepTime) * time.Millisecond)
 		}
 	}
 }
@@ -131,8 +137,8 @@ func (s *Server)Tick(deltaTime float32) {
 				break
 			}
 
-			int offset = 0
-			string name = ReadString(msg, &offset)
+			offset := 0
+			name := ReadString(msg, &offset)
 
 			if name == "Login" {
 				// remove from server and put to lobby
@@ -152,22 +158,35 @@ func (s *Server)Tick(deltaTime float32) {
 ////////////////////////////
 type Player struct {
 	playerId uint32
-	conn net.Conn
+
 	readMsgs chan []byte
+
+	conn* websocket.Conn
+	disconnect bool
+
+	roomId uint32
+	battleId uint32
 }
 
 func (p *Player) Init() {
 
 	// start read goroutine
-	p.readMsgs = make(chan Msg*, 1024)
+	p.readMsgs = make(chan []byte)
 	go p.ReadMsgCoroutine()
+	p.disconnect = false
+
+	// 0 means not in room or battle
+	p.roomId = 0
+	p.battleId = 0
 }
 
-func (p *player) ReadMsgCoroutine() {
+func (p *Player) ReadMsgCoroutine() {
 	for {
 		_ , msg, err := p.conn.ReadMessage()
 		if err != nil {
-			fmt.Println("read error", err)
+			fmt.Println("player disconnect", p.playerId, err)
+			p.disconnect = true
+			//TODO kick off lobby/room, but should not tick off battle
 			return
 		}
 		fmt.Printf("receive from:%s message: %s\n", p.conn.RemoteAddr(), string(msg))
@@ -175,12 +194,8 @@ func (p *player) ReadMsgCoroutine() {
 	}
 }
 
-func (p *player) SendMsg(msg []byte)
-{
-	err := p.conn.WriteMessage(websocket.TextMessage, msg)
-	if err {
-		fmt.Println("send error", err)
-	}
+func (p *Player) SendMsg(msg []byte) {
+	p.conn.WriteMessage(websocket.TextMessage, msg)
 }
 
 ////////////////////////////
@@ -197,7 +212,7 @@ func (l *Lobby) Init() {
 
 func (l *Lobby) Tick(deltaTime float32) {
 
-	s := GetServerInstace()
+	s := GetServerInstance()
 	for _, player := range l.players {
 
 		for {
@@ -206,23 +221,24 @@ func (l *Lobby) Tick(deltaTime float32) {
 				break
 			}
 
-			int offset = 0
-			string name = ReadString(msg, &offset)
+			offset := 0
+			name := ReadString(msg, &offset)
 			if name == "CreateRoom" {
 
 				// crate new room
-				uint32 mapId = ReadUInt32(msg, &offset)
-				newRoom := &Room{s.maxRoomId++}
+				mapId := ReadUInt32(msg, &offset)
+				s.maxRoomId++
+				newRoom := &Room{s.maxRoomId, mapId, nil}
 				newRoom.Init()
 
-				// player exist lobby, and enter room
+				// enter room
+				player.roomId = newRoom.roomId
 				newRoom.players = append(newRoom.players, player)
-				delete(l.players, player.playerId)
 				s.rooms[newRoom.roomId] = newRoom
 
 				// notify player enter room
 				// fmt: EnterRoom|playerNum|playerId1|playerId2|...
-				msg := make([]byte, 0)
+				msg := make([]byte, 0, 32)
 				WriteString(msg, "EnterRoom")
 				WriteUInt32(msg, newRoom.roomId)
 				WriteUInt32(msg, newRoom.mapId)
@@ -233,22 +249,22 @@ func (l *Lobby) Tick(deltaTime float32) {
 				continue
 			}
 			if name == "JoinRoom" {
-				uint32 roomId = ReadUInt32(msg, &offset)
+				roomId := ReadUInt32(msg, &offset)
 				room, exist := s.rooms[roomId]
 				if exist {
-					// player exist lobby, and enter room
+					// player enter room
+					player.roomId = roomId
 					room.players = append(room.players, player)
-					delete(l.players, player.playerId)
 
 					// notify all player that a new menber come in
 					// fmt: EnterRoom|roomId|mapId|playerNum|playerId1|playerId2|...
-					msg := make([]byte, 0)
+					msg := make([]byte, 0, 32)
 					WriteString(msg, "EnterRoom")
 					WriteUInt32(msg, room.roomId)
 					WriteUInt32(msg, room.mapId)
-					WriteUInt32(msg, len(room.players))
+					WriteUInt32(msg, uint32(len(room.players)))
 					for i := 0; i < len(room.players); i++ {
-						WriteUInt32(room.players[i].playerId)
+						WriteUInt32(msg, room.players[i].playerId)
 					}
 					for i := 0; i < len(room.players); i++ {
 						room.players[i].SendMsg(msg)
@@ -256,11 +272,33 @@ func (l *Lobby) Tick(deltaTime float32) {
 				}
 				continue
 			}
-			if name == "InvitePlayer" {
+			if name == "GetPlayersInfo" {
+				responeMsg := make([]byte, 0, 32)
+
+				// collect all request player infos
+				requestPlayerNum := ReadUInt32(msg, &offset)
+				var responePlayerNum uint32 = 0
+				for i := 0; i < int(requestPlayerNum); i++ {
+					playerId := ReadUInt32(msg, &offset)
+					findPlayer, exist := l.players[playerId]
+					if exist {
+						WriteUInt32(responeMsg, findPlayer.playerId)
+						WriteUInt32(responeMsg, findPlayer.battleId)
+						WriteUInt32(responeMsg, findPlayer.roomId)
+						responePlayerNum++
+					}
+				}
+
+				// append head, and send
+				responeMsgHead := make([]byte, 0, 32)
+				WriteString(responeMsgHead, "ResponePlayersInfo")
+				WriteUInt32(responeMsgHead, responePlayerNum)
+				responeMsg = append(responeMsgHead, responeMsg...)
+				player.SendMsg(responeMsg)
+
 				continue
 			}
 		}
-
 	}
 }
 
@@ -270,20 +308,24 @@ func (l *Lobby) Tick(deltaTime float32) {
 // multi client can enter one room, chat or ready to start a battle, come from lobby
 ////////////////////////////
 type Room struct {
+	roomId uint32
 	mapId uint32
 	players []*Player // first player is the captain
 }
 
 func (r *Room) Init() {
-	r.players = make([]*Player, 0)
+	if r.players == nil {
+		r.players = make([]*Player, 0, 4)
+	}
 
 }
 
 func (r *Room) Tick(delta float32) {
 
-	s = GetServerInstance()
+	playerNum := len(r.players)
+	s := GetServerInstance()
 	for i := 0; i < playerNum; i++ {
-		player := b.players[i]
+		player := r.players[i]
 
 		for {
 			msg, ok:= <-player.readMsgs
@@ -291,33 +333,38 @@ func (r *Room) Tick(delta float32) {
 				break
 			}
 
-			int offset = 0
-			string name = ReadString(msg, &offset)
+			offset := 0
+			name := ReadString(msg, &offset)
 
 			// captain only msg
 			if i == 0 {
 				if name == "StartBattle" {
 					// creat new battle
-					newBattle := &Battle{s.maxBattleId++, r.mapId}
-					newBattle.players = r.players
+					s.maxBattleId++
+					newBattle := &Battle{s.maxBattleId, r.mapId, r.players, nil, nil, 0}
 					newBattle.Init()
 
 					// dismiss room, players enter battle, and start a new battle
 					delete(s.rooms, r.roomId)
 					s.battles[newBattle.battleId] = newBattle
+					for j := 0; j < playerNum; j++ {
+						player := r.players[j]
+						player.roomId = 0
+						player.battleId = newBattle.battleId
+					}
 
 					// notify players enter a battle
 					// msg format: battleId|mapId|playerNum|playerid1|playerid2|...
-					msg := make([]byte, 0)
+					msg := make([]byte, 0, 32)
 					WriteString(msg, "EnterBattle")
 					WriteUInt32(msg, newBattle.battleId)
 					WriteUInt32(msg, r.mapId)
-					WriteUInt32(msg, playerNum)
+					WriteUInt32(msg, uint32(playerNum))
 					for j := 0; j < playerNum; j++ {
 						WriteUInt32(msg, r.players[j].playerId)
 					}
 					for j := 0; j < playerNum; j++ {
-						j.SendMsg(msg)
+						r.players[j].SendMsg(msg)
 					}
 
 					continue
@@ -360,7 +407,7 @@ func (b *Battle) Init() {
 	// init curr farmedata, default 0
 	b.currFrameIndex = 0
 	b.currFrameData = make([]byte, playerNum)
-	for i := 0; i < clientNum; i++ {
+	for i := 0; i < playerNum; i++ {
 		b.currFrameData[i] = 0
 	}
 }
@@ -370,8 +417,8 @@ func (b *Battle) Tick(delta float32) {
 	playerNum := len(b.players)
 
 	// pase client message
-	bool bReceiveEnd = 0
-	bool bWin = 0
+	bReceiveEnd := false
+	bWin := false
 	for i := 0; i < playerNum; i++ {
 		player := b.players[i]
 
@@ -381,80 +428,87 @@ func (b *Battle) Tick(delta float32) {
 				break
 			}
 
-			int offset = 0
-			string name = ReadString(msg, &offset)
+			offset := 0
+			name := ReadString(msg, &offset)
 
 			// collect all client frame data
 			if name == "UploadFrameData" {
 				// frameData can ref client 8 button press status
-				byte frameData = ReadByte(msg, &offset)
-				s.currFrameData[i] = frameData
+				frameData := ReadByte(msg, &offset)
+				b.currFrameData[i] = frameData
+				continue
 			}
-			else if name == "EndBattle" {
-				bReceiveEnd = 1
+			if name == "EndBattle" {
+				bReceiveEnd = true
 				bWin = ReadBool(msg, &offset)
+				continue
 			}
 		}
 	}
 
+	if bReceiveEnd {
+		b.BattleEnd(bWin)
+		return
+	}
+
 	// broadcast
-	msg := make([]byte, 0)
+	msg := make([]byte, 0, 32)
 	msg = WriteString(msg, "ReceiveFrameData")
-	msg = WriteByteArray(msg, currFrameData)
+	msg = WriteByteArray(msg, b.currFrameData)
 	for i := 0; i < playerNum; i++ {
-		s.players[i].SendMsg(msg)
+		b.players[i].SendMsg(msg)
 	}
 
 	// add to record
-	s.frameDataRecord = append(s.frameDataRecord, s.currFrameData)
-	s.currFrameIndex += 1
-
-	if bReceiveEnd {
-		s.BattleEnd(bWin)
-	}
+	b.frameDataRecord = append(b.frameDataRecord, b.currFrameData...)
+	b.currFrameIndex++
 }
 
-func (b Battle*)BattleEnd(bWin bool)
-{
+func (b *Battle)BattleEnd(bWin bool) {
 	// generate frameDataRecord 
 	// format: |4byte:mapid|1byte:playernum|4byte:playerid1|4byte:playerid2|...
 	// |1byte:win|2byte:frameDataCount|1byte:player1framedata|1byate:player2framedata|...
 	playerNum := len(b.players)
-	frameDataHead := make([]byte, 0)
-	frameDataHead = WriteUInt32(frameDataHead, this.mapId)
-	frameDataHead = WriteByte(frameDataHead, (byte)playerNum)
+	frameDataHead := make([]byte, 0, 32)
+	frameDataHead = WriteUInt32(frameDataHead, b.mapId)
+	frameDataHead = WriteUInt32(frameDataHead, uint32(playerNum))
 	for i := 0; i < playerNum; i++ {
-		frameDataHead = WriteUInt32(frameDataHead, s.player[i].playerId)
+		frameDataHead = WriteUInt32(frameDataHead, b.players[i].playerId)
 	}
 	frameDataHead = WriteBool(frameDataHead, bWin)
-	frameDataHead = WriteUInt32(frameDataHead, s.currFrameIndex)
-	s.frameDataRecord = append(frameDataHead, s.frameDataRecord...)
+	frameDataHead = WriteUInt32(frameDataHead, b.currFrameIndex)
+	b.frameDataRecord = append(frameDataHead, b.frameDataRecord...)
 
 	//TODO: should not use battleId as filename, because battleId may reset
 	// save frameDataRecord to file. then client can replay this battle
-	ioutil.WriteFile(fmt.Sprintf("./BattleReord/%d", this.battleId), this.frameDataRecord, 0666)
+	ioutil.WriteFile(fmt.Sprintf("./BattleReord/%d", b.battleId), b.frameDataRecord, 0666)
 
 	// create a new room
 	s := GetServerInstance()
-	newRoom := &Room{s.maxRoomId++, b.mapId}
-	newRoom.players = b.players
+	s.maxRoomId++
+	newRoom := &Room{s.maxRoomId, b.mapId, b.players}
 	newRoom.Init()
 
 	// send player back to room, and dismiss battle
 	s.rooms[newRoom.roomId] = newRoom
 	delete(s.battles, b.battleId)
+	for i := 0; i < len(newRoom.players); i++ {
+		player := newRoom.players[i]
+		player.battleId = 0
+		player.roomId = newRoom.roomId
+	}
 
 	// motify players enter room
 	// fmt: EnterRoom|roomId|mapId|playerNum|playerId1|playerId2|...
-	msg := make([]byte, 0)
+	msg := make([]byte, 0, 32)
 	WriteString(msg, "EnterRoom")
 	WriteUInt32(msg, newRoom.roomId)
 	WriteUInt32(msg, newRoom.mapId)
-	WriteUInt32(msg, len(newRoom.players))
-	for i := 0; i < len(newRoom.players); i++ {
-		WriteUInt32(newRoom.players[i].playerId)
+	WriteUInt32(msg, uint32(playerNum))
+	for i := 0; i < playerNum; i++ {
+		WriteUInt32(msg, newRoom.players[i].playerId)
 	}
-	for i := 0; i < len(newRoom.players); i++ {
+	for i := 0; i < playerNum; i++ {
 		newRoom.players[i].SendMsg(msg)
 	}
 }
@@ -463,30 +517,30 @@ func (b Battle*)BattleEnd(bWin bool)
 ////////////////////////////
 // Message parse
 ////////////////////////////
-func ReadByteArray(data []byte, offset int*) []byte {
+func ReadByteArray(data []byte, offset *int) []byte {
 
 	// read a string length, 2 bytes
-	uint16 length = 0
-	length |= data[*offset + 1]
+	var length uint16 = 0
+	length |= uint16(data[*offset + 1])
 	length <<= 8
-	length |= data[*offset]
+	length |= uint16(data[*offset])
 
 	// read string
-	*offset += (2 + length)
-	return data[*offset+2 : *offset+2+length]
+	*offset += (2 + int(length))
+	return data[*offset+2 : *offset+2+int(length)]
 }
 
 func WriteByteArray(data []byte, byteArray []byte) []byte {
 
 	// write string length, 2bytes
-	uint16 length = len(byteArray)
-	append(data, (byte)length, (byte)(length << 8))
+	var length uint16 = uint16(len(byteArray))
+	data = append(data, byte(length), byte(length >> 8))
 
 	// write string
 	return append(data, byteArray...)
 }
 
-func ReadString(data []byte, offset int*) string {
+func ReadString(data []byte, offset *int) string {
 	return string(ReadByteArray(data, offset))
 }
 
@@ -494,11 +548,11 @@ func WriteString(data []byte, str string) []byte {
 	return WriteByteArray(data, []byte(str))
 }
 
-func ReadFloat64(data []byte, offset int*) float64 {
+func ReadFloat64(data []byte, offset *int) float64 {
 	// use IEEE 754, 8 byte
-	uint64 bits = 0
-	for int32 i = 7; i >= 0; i-- {
-		bits |= data[*offset + i]
+	var bits uint64 = 0
+	for i := 7; i >= 0; i-- {
+		bits |= uint64(data[*offset + i])
 		bits <<= 8
 	}
 	*offset += 8
@@ -506,20 +560,20 @@ func ReadFloat64(data []byte, offset int*) float64 {
 }
 
 func WriteFloat64(data []byte, flt float64) []byte {
-	uint64 bits = math.Float64bits(flt)
+	var bits uint64 = math.Float64bits(flt)
 
-	for int32 i = 0; i < 8; i++ {
-		data = append(data, (byte)bits)
+	for i := 0; i < 8; i++ {
+		data = append(data, byte(bits))
 		bits >>= 8
 	}
 	return data
 }
 
-func ReadUInt32(data []byte, offset int*) uint32 {
+func ReadUInt32(data []byte, offset *int) uint32 {
 	// 4 byte
-	int32 value = 0
-	for int32 i = 3; i >= 0; i++ {
-		value |= data[*offset + i]
+	var value uint32 = 0
+	for i := 3; i >= 0; i++ {
+		value |= uint32(data[*offset + i])
 		value <<= 8
 	}
 	*offset += 4
@@ -527,30 +581,33 @@ func ReadUInt32(data []byte, offset int*) uint32 {
 }
 
 func WriteUInt32(data []byte, intValue uint32) []byte {
-	for int32 i = 0; i < 3; i++ {
-		data = append(data, (byte)intValue)
+	for i := 0; i < 3; i++ {
+		data = append(data, byte(intValue))
 		intValue >>= 8
 	}
 	return data
 }
 
-func ReadByte(data []byte, offset int*) byte {
-	byte value = data[*offset]
+func ReadByte(data []byte, offset *int) byte {
+	value := data[*offset]
 	*offset += 1
 	return value
 }
 
 func WriteByte(data []byte, intValue byte) []byte {
-	return append(data, intValue))
+	return append(data, intValue)
 }
 
-func ReadBool(data []byte, offset int*) bool {
+func ReadBool(data []byte, offset *int) bool {
 	// 1 byte
-	bool result = (bool)data[*offset]
+	var result bool = data[*offset] == 1
 	*offset += 1
 	return result
 }
 
 func WriteBool(data []byte, bValue bool) []byte {
-	return append(data, (byte)bValue)
+	if (bValue) {
+		return append(data, byte(1))
+	}
+	return append(data, byte(0))
 }
