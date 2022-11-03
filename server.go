@@ -51,12 +51,25 @@ func (s *Server)Init() {
 	s.maxBattleId = 0
 
 	s.playersNoLogin = make([]*Player, 0, 128)
-	s.newPlayerChan = make(chan *Player)
+	s.newPlayerChan = make(chan *Player, 1024)
 
 	s.upgrader = websocket.Upgrader {
 		ReadBufferSize: 1024,
 		WriteBufferSize: 1024,
 	}
+
+	// unit test message parase
+	msg := make([]byte, 0)
+	msg = WriteUInt32(msg, uint32(456))
+	msg = WriteString(msg, "hello")
+	msg = WriteBool(msg, true)
+	msg = WriteByte(msg, 128)
+	offset := 0
+	aaa := ReadUInt32(msg, &offset)
+	bbb := ReadString(msg, &offset)
+	ccc := ReadBool(msg, &offset)
+	ddd := ReadByte(msg, &offset)
+	fmt.Println("Init", len(msg), msg, aaa, bbb, ccc, ddd)
 }
 
 func (s *Server)Start() {
@@ -121,25 +134,35 @@ func (s *Server)Tick(deltaTime float32) {
 
 	// consume newPlayerChan
 	for {
-		newPlayer, ok:= <-s.newPlayerChan
-		if !ok {
+		bNoNewPlayer := false
+		select {
+			case newPlayer := <-s.newPlayerChan:
+				s.playersNoLogin = append(s.playersNoLogin, newPlayer)
+			default:
+				bNoNewPlayer = true
+		}
+		if bNoNewPlayer {
 			break
 		}
-		s.playersNoLogin = append(s.playersNoLogin, newPlayer)
 	}
 
-	// handle player login, 
+	// handle player login
 	for i := 0; i < len(s.playersNoLogin); i++ {
 		player := s.playersNoLogin[i]
 		for {
-			msg, ok:= <-player.readMsgs
-			if !ok {
+			bNoNewMsg := false
+			var msg []byte
+			select {
+				case msg = <-player.readMsgs:
+				default:
+					bNoNewMsg = true
+			}
+			if bNoNewMsg {
 				break
 			}
 
 			offset := 0
 			name := ReadString(msg, &offset)
-
 			if name == "Login" {
 				// remove from server and put to lobby
 				player.playerId = ReadUInt32(msg, &offset)
@@ -148,6 +171,7 @@ func (s *Server)Tick(deltaTime float32) {
 				i--
 				break
 			}
+
 		}
 	}
 }
@@ -171,7 +195,7 @@ type Player struct {
 func (p *Player) Init() {
 
 	// start read goroutine
-	p.readMsgs = make(chan []byte)
+	p.readMsgs = make(chan []byte, 1024)
 	go p.ReadMsgCoroutine()
 	p.disconnect = false
 
@@ -216,8 +240,14 @@ func (l *Lobby) Tick(deltaTime float32) {
 	for _, player := range l.players {
 
 		for {
-			msg, ok:= <-player.readMsgs
-			if !ok {
+			bNoNewMsg := false
+			var msg []byte
+			select {
+				case msg = <-player.readMsgs:
+				default:
+					bNoNewMsg = true
+			}
+			if bNoNewMsg {
 				break
 			}
 
@@ -328,8 +358,14 @@ func (r *Room) Tick(delta float32) {
 		player := r.players[i]
 
 		for {
-			msg, ok:= <-player.readMsgs
-			if !ok {
+			bNoNewMsg := false
+			var msg []byte
+			select {
+				case msg = <-player.readMsgs:
+				default:
+					bNoNewMsg = true
+			}
+			if bNoNewMsg {
 				break
 			}
 
@@ -423,8 +459,14 @@ func (b *Battle) Tick(delta float32) {
 		player := b.players[i]
 
 		for {
-			msg, ok:= <-player.readMsgs
-			if !ok {
+			bNoNewMsg := false
+			var msg []byte
+			select {
+				case msg = <-player.readMsgs:
+				default:
+					bNoNewMsg = true
+			}
+			if bNoNewMsg {
 				break
 			}
 
@@ -524,10 +566,13 @@ func ReadByteArray(data []byte, offset *int) []byte {
 	length |= uint16(data[*offset + 1])
 	length <<= 8
 	length |= uint16(data[*offset])
+	*offset += 2
+	fmt.Println(length)
 
 	// read string
-	*offset += (2 + int(length))
-	return data[*offset+2 : *offset+2+int(length)]
+	result := data[*offset : *offset+int(length)]
+	*offset += int(length)
+	return result
 }
 
 func WriteByteArray(data []byte, byteArray []byte) []byte {
@@ -553,7 +598,9 @@ func ReadFloat64(data []byte, offset *int) float64 {
 	var bits uint64 = 0
 	for i := 7; i >= 0; i-- {
 		bits |= uint64(data[*offset + i])
-		bits <<= 8
+		if i > 0 {
+			bits <<= 8
+		}
 	}
 	*offset += 8
 	return math.Float64frombits(bits)
@@ -570,18 +617,21 @@ func WriteFloat64(data []byte, flt float64) []byte {
 }
 
 func ReadUInt32(data []byte, offset *int) uint32 {
+	fmt.Println(*offset)
 	// 4 byte
 	var value uint32 = 0
-	for i := 3; i >= 0; i++ {
+	for i := 3; i >= 0; i-- {
 		value |= uint32(data[*offset + i])
-		value <<= 8
+		if i > 0 {
+			value <<= 8
+		}
 	}
 	*offset += 4
 	return value
 }
 
 func WriteUInt32(data []byte, intValue uint32) []byte {
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		data = append(data, byte(intValue))
 		intValue >>= 8
 	}
