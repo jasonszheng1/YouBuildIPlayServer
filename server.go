@@ -3,9 +3,12 @@ package main
 import (
     "math"
     "fmt"
+    "sync"
     "net/http"
     "io/ioutil"
     "time"
+    "crypto/md5"
+    "hash"
     "github.com/gorilla/websocket"
     _"github.com/go-sql-driver/mysql"
     "github.com/jmoiron/sqlx"
@@ -193,6 +196,7 @@ func (s *Server)Tick(deltaTime float32) {
             if name == "Login" {
                 // remove from server and put to lobby
                 player.playerId = ReadUInt32(msg, &offset)
+                player.playerName = ReadString(msg, &offset)
                 s.lobby.players[player.playerId] = player
                 s.playersNoLogin = append(s.playersNoLogin[:i], s.playersNoLogin[i+1:]...)
                 i--
@@ -209,14 +213,24 @@ func (s *Server)Tick(deltaTime float32) {
 ////////////////////////////
 type Player struct {
     playerId uint32
+    playerName string
 
     readMsgs chan []byte
+    sendMutex sync.Mutex
 
     conn* websocket.Conn
     disconnect bool
 
     roomId uint32
     battleId uint32
+
+    // mapdata is upload by many part(msg), so need cache, after upload all part, combine them and save to file
+    // after combine them, we check the md5
+    mapPartDataCache []byte
+    mapExpectSize uint32
+    mapReceiveSize uint32
+    mapExpectMd5 []byte
+    mapReceiveMd5 hash.Hash
 }
 
 func (p *Player) Init() {
@@ -229,6 +243,12 @@ func (p *Player) Init() {
     // 0 means not in room or battle
     p.roomId = 0
     p.battleId = 0
+
+    // map receive cache
+    p.mapPartDataCache = make([]byte, 0)
+    p.mapExpectSize = 0
+    p.mapReceiveSize = 0
+    p.mapExpectMd5 = make([]byte, 0, 16)
 }
 
 func (p *Player) ReadMsgCoroutine() {
@@ -237,7 +257,7 @@ func (p *Player) ReadMsgCoroutine() {
         if err != nil {
             fmt.Println("player disconnect", p.playerId, err)
             p.disconnect = true
-            //TODO kick off lobby/room, but should not tick off battle
+            //TODO kick off lobby/room/battle
             return
         }
         fmt.Printf("receive from:%s message: %s\n", p.conn.RemoteAddr(), string(msg))
@@ -246,7 +266,123 @@ func (p *Player) ReadMsgCoroutine() {
 }
 
 func (p *Player) SendMsg(msg []byte) {
+    p.sendMutex.Lock()
     p.conn.WriteMessage(websocket.TextMessage, msg)
+    p.sendMutex.Unlock()
+}
+
+func (p *Player) OnReceiveMapPartData(mapPartData []byte) {
+    s := GetServerInstance()
+
+    // append part data
+    p.mapReceiveSize += uint32(len(mapPartData))
+    p.mapReceiveMd5.Write(mapPartData)
+    p.mapPartDataCache = append(p.mapPartDataCache, mapPartData...)
+
+    // receive end, check md5 and save to file
+    if p.mapReceiveSize >= p.mapExpectSize {
+
+        // check file md5
+        checkMd5Success := true
+        receiveMd5 := p.mapReceiveMd5.Sum(nil) 
+        for i := 0; i < 16; i++ {
+            if receiveMd5[i] != p.mapExpectMd5[i] {
+                checkMd5Success = false
+                break
+            }
+        }
+
+        // check end, send upload result
+        sendMsg := make([]byte, 0, 32)
+        WriteString(sendMsg, "UploadMapRespone")
+        WriteBool(sendMsg, checkMd5Success)
+        if !checkMd5Success {
+            WriteString(sendMsg, "Md5CheckFail")
+        }
+        p.SendMsg(sendMsg)
+
+        if checkMd5Success {
+
+            // save map to file
+            s.maxMapId++
+            newMapId := s.maxMapId
+            ioutil.WriteFile(fmt.Sprintf("./maps/%d", newMapId), p.mapPartDataCache, 0666)
+
+            // insert a record to db
+            _, err := s.db.Exec("insert into Map values(?,?,?,?,?)", newMapId, p.playerId, p.mapReceiveSize, string(receiveMd5), 0)
+            if err != nil {
+                fmt.Println(err)
+            }
+
+            // update max mapId to db
+            _, err1 := s.db.Exec("update Global set maxMapId = ?", newMapId)
+            if err1 != nil {
+                fmt.Println(err1)
+            }
+        }
+
+        // receive end, reset to refuse next body upload
+        p.mapExpectSize = 0
+    }
+}
+
+//TODO: file size too big will cause server lag, so create a thread to do this
+func (p *Player) SendFileCoroutine(filePath string, msgName string) {
+
+    // file not exist?
+    fileData, err := ioutil.ReadFile(filePath)
+    if err != nil {
+        responeMsg := make([]byte, 0, 32)
+        WriteString(responeMsg, fmt.Sprintf("%sHead", msgName))
+        WriteBool(responeMsg, false)
+        WriteString(responeMsg, "RequestFileMissing??")
+        p.SendMsg(responeMsg)
+        return
+    }
+
+    fileSize := len(fileData)
+    fileMd5Array := md5.Sum(fileData)
+    fileMd5 := make([]byte, 16)
+    copy(fileMd5, fileMd5Array[:])
+
+    // Send file content
+    bHead := true
+    sendSize := 0
+    for {
+
+        responeMsg := make([]byte, 0, 1024)
+        remainSendSize := 1024
+
+        if bHead {
+            WriteString(responeMsg, fmt.Sprintf("%sHead", msgName))
+            WriteBool(responeMsg, true)
+            WriteUInt32(responeMsg, uint32(fileSize))
+            WriteByteArray(responeMsg, fileMd5)
+            remainSendSize = 1024 - len(responeMsg)
+        } else {
+            WriteString(responeMsg, fmt.Sprintf("%sBody", msgName))
+        }
+
+        remainSendSize -= 2 // 2 byte respone to the size of part data
+        sendEnd := false
+        if remainSendSize + sendSize >= fileSize {
+            remainSendSize = fileSize - sendSize
+            sendEnd = true
+        }
+
+        // send file part
+        WriteByteArray(responeMsg, fileData[sendSize : (sendSize+remainSendSize)])
+        p.SendMsg(responeMsg)
+        sendSize += remainSendSize
+
+        // send end
+        if sendEnd {
+            break
+        }
+
+        // sleep to avoid lap
+        time.Sleep(10 * time.Millisecond)
+    }
 }
 
 ////////////////////////////
@@ -305,6 +441,7 @@ func (l *Lobby) Tick(deltaTime float32) {
 
                 continue
             }
+
             if name == "JoinRoom" {
                 roomId := ReadUInt32(msg, &offset)
                 room, exist := s.rooms[roomId]
@@ -329,6 +466,7 @@ func (l *Lobby) Tick(deltaTime float32) {
                 }
                 continue
             }
+
             if name == "GetPlayersInfo" {
                 responeMsg := make([]byte, 0, 32)
 
@@ -353,6 +491,62 @@ func (l *Lobby) Tick(deltaTime float32) {
                 responeMsg = append(responeMsgHead, responeMsg...)
                 player.SendMsg(responeMsg)
 
+                continue
+            }
+
+            if name == "UploadMapHead" {
+
+                player.mapExpectSize = ReadUInt32(msg, &offset)
+                // a gaint file?? 10MB ?? not allow
+                if player.mapExpectSize >= 1024 * 1024 * 10 {
+                    player.mapExpectSize = 0
+                    sendMsg := make([]byte, 0, 32)
+                    WriteString(sendMsg, "UploadMapRespone")
+                    WriteBool(sendMsg, false)
+                    WriteString(sendMsg, "SizeTooBig")
+                    player.SendMsg(sendMsg)
+                    continue
+                }
+
+                // head, reset player all map caches
+                player.mapExpectMd5 = ReadByteArray(msg, &offset)
+                player.mapReceiveSize = 0
+                player.mapReceiveMd5 = md5.New()
+                player.mapPartDataCache = make([]byte, 0, player.mapExpectSize)
+
+                // handle map part data
+                mapPartData := ReadByteArray(msg, &offset)
+                player.OnReceiveMapPartData(mapPartData)
+
+                continue
+            }
+
+            if name == "UploadMapBody" {
+
+                // maybe client not send UploadMapHead first, or size too big, refuse by UploadMapHead
+                if player.mapExpectSize == 0 {
+                    continue
+                }
+
+                // handle map part data
+                mapPartData := ReadByteArray(msg, &offset)
+                player.OnReceiveMapPartData(mapPartData)
+
+                continue
+            }
+
+            if name == "DownloadMap" {
+
+                mapId := ReadUInt32(msg, &offset)
+                filePath := fmt.Sprintf("./maps/%d", mapId)
+                go player.SendFileCoroutine(filePath, "DownloadMapRespone")
+                continue
+            }
+
+            if name == "DownloadBattleReplay" {
+                battleId := ReadUInt32(msg, &offset)
+                filePath := fmt.Sprintf("./battleReplay/%d", battleId)
+                go player.SendFileCoroutine(filePath, "DownloadBattleReplayRespone")
                 continue
             }
         }
@@ -404,7 +598,7 @@ func (r *Room) Tick(delta float32) {
                 if name == "StartBattle" {
                     // creat new battle
                     s.maxBattleId++
-                    newBattle := &Battle{s.maxBattleId, r.mapId, r.players, nil, nil, 0}
+                    newBattle := &Battle{s.maxBattleId, r.mapId, r.players, nil, nil, 0, 0}
                     newBattle.Init()
 
                     // dismiss room, players enter battle, and start a new battle
@@ -455,9 +649,10 @@ type Battle struct {
     battleId uint32
     mapId uint32
     players []*Player
-    frameDataRecord []byte
+    replayData []byte
     currFrameData []byte
     currFrameIndex uint32
+    tickCount uint32
 }
 
 func (b *Battle) Init() {
@@ -465,7 +660,7 @@ func (b *Battle) Init() {
     playerNum := len(b.players)
 
     // record whole battle frame datas, reserve a big size
-    b.frameDataRecord = make([]byte, 0, playerNum * 10240)
+    b.replayData = make([]byte, 0, playerNum * 10240)
 
     // init curr farmedata, default 0
     b.currFrameIndex = 0
@@ -473,9 +668,48 @@ func (b *Battle) Init() {
     for i := 0; i < playerNum; i++ {
         b.currFrameData[i] = 0
     }
+    b.tickCount = 0
+
+    // update max battleId to db
+    s := GetServerInstance()
+    _, err := s.db.Exec("update Global set maxBattleId = ?", b.battleId)
+    if err != nil {
+        fmt.Println(err)
+    }
+
+    // insert a battle record to db
+    // ugly code, but sql not support save a array...
+    playTime := time.Now().Format("2006-01-02 15:04:05")
+    var playerId0 uint32 = 0
+    var playerId1 uint32 = 0
+    var playerId2 uint32 = 0
+    var playerId3 uint32 = 0
+    if playerNum > 0 {
+        playerId0 = b.players[0].playerId
+    }
+    if playerNum > 1 {
+        playerId1 = b.players[1].playerId
+    }
+    if playerNum > 2 {
+        playerId2 = b.players[2].playerId
+    }
+    if playerNum > 3 {
+        playerId3 = b.players[3].playerId
+    }
+    _, err = s.db.Exec("insert into Battle values(?,?,?,?,?,?,?)", b.battleId, b.mapId, playTime, playerId0, playerId1, playerId2, playerId3)
+    if err != nil {
+        fmt.Println(err)
+    }
 }
 
 func (b *Battle) Tick(delta float32) {
+
+    // max battle time 30min, why client not upload EndBattle?? force stop it
+    b.tickCount++
+    if b.tickCount > 18000 {
+        b.BattleEnd(false)
+        return
+    }
 
     playerNum := len(b.players)
 
@@ -522,34 +756,33 @@ func (b *Battle) Tick(delta float32) {
 
     // broadcast
     msg := make([]byte, 0, 32)
-    msg = WriteString(msg, "ReceiveFrameData")
+    msg = WriteString(msg, "ResponeFrameData")
     msg = WriteByteArray(msg, b.currFrameData)
     for i := 0; i < playerNum; i++ {
         b.players[i].SendMsg(msg)
     }
 
-    // add to record
-    b.frameDataRecord = append(b.frameDataRecord, b.currFrameData...)
+    // add to replay data
+    b.replayData = append(b.replayData, b.currFrameData...)
     b.currFrameIndex++
 }
 
 func (b *Battle)BattleEnd(bWin bool) {
-    // generate frameDataRecord 
-    // format: |4byte:mapid|1byte:playernum|4byte:playerid1|4byte:playerid2|...
-    // |1byte:win|2byte:frameDataCount|1byte:player1framedata|1byate:player2framedata|...
-    playerNum := len(b.players)
-    frameDataHead := make([]byte, 0, 32)
-    frameDataHead = WriteUInt32(frameDataHead, b.mapId)
-    frameDataHead = WriteUInt32(frameDataHead, uint32(playerNum))
-    for i := 0; i < playerNum; i++ {
-        frameDataHead = WriteUInt32(frameDataHead, b.players[i].playerId)
-    }
-    frameDataHead = WriteBool(frameDataHead, bWin)
-    frameDataHead = WriteUInt32(frameDataHead, b.currFrameIndex)
-    b.frameDataRecord = append(frameDataHead, b.frameDataRecord...)
 
-    // save frameDataRecord to file. then client can replay this battle
-    ioutil.WriteFile(fmt.Sprintf("./BattleReord/%d", b.battleId), b.frameDataRecord, 0666)
+    // generate replayData 
+    playerNum := len(b.players)
+    replayDataHead := make([]byte, 0, 32)
+    replayDataHead = WriteUInt32(replayDataHead, b.mapId)
+    replayDataHead = WriteUInt32(replayDataHead, uint32(playerNum))
+    for i := 0; i < playerNum; i++ {
+        replayDataHead = WriteUInt32(replayDataHead, b.players[i].playerId)
+    }
+    replayDataHead = WriteBool(replayDataHead, bWin)
+    replayDataHead = WriteUInt32(replayDataHead, b.currFrameIndex)
+    b.replayData = append(replayDataHead, b.replayData...)
+
+    // save replayData to file. then client can replay this battle
+    ioutil.WriteFile(fmt.Sprintf("./battleReplay/%d", b.battleId), b.replayData, 0666)
 
     // create a new room
     s := GetServerInstance()
@@ -601,6 +834,9 @@ type PlayerTable struct {
 
 type MapTable struct {
     MapId uint32 `db:"mapId"`
+    OwnerPlayerId uint32 `db:"ownerPlayerId"`
+    Size uint32 `db:"size"`
+    Md5 string `db:"md5"`
     LikeNum uint32 `db:"likeNum"`
 }
 
