@@ -7,6 +7,8 @@ import (
 	"io/ioutil"
 	"time"
 	"github.com/gorilla/websocket"
+    _"github.com/go-sql-driver/mysql"
+    "github.com/jmoiron/sqlx"
 )
 
 ////////////////////////////
@@ -23,6 +25,7 @@ type Server struct {
 	lobby *Lobby
 	rooms map[uint32]*Room
 	battles map[uint32]*Battle
+    maxMapId uint32
 	maxRoomId uint32
 	maxBattleId uint32
 
@@ -30,6 +33,8 @@ type Server struct {
 	newPlayerChan chan *Player
 
 	upgrader websocket.Upgrader
+
+    db *sqlx.DB
 }
 
 var serverInstance *Server
@@ -47,34 +52,58 @@ func (s *Server)Init() {
 	s.lobby.Init()
 	s.rooms = make(map[uint32]*Room)
 	s.battles = make(map[uint32]*Battle)
+    s.maxMapId = 0
 	s.maxRoomId = 0
 	s.maxBattleId = 0
 
 	s.playersNoLogin = make([]*Player, 0, 128)
-	s.newPlayerChan = make(chan *Player, 1024)
+	s.newPlayerChan = make(chan *Player, 32)
 
 	s.upgrader = websocket.Upgrader {
 		ReadBufferSize: 1024,
 		WriteBufferSize: 1024,
 	}
 
-	// unit test message parase
-	msg := make([]byte, 0)
-	msg = WriteUInt32(msg, uint32(456))
-	msg = WriteString(msg, "hello")
-	msg = WriteBool(msg, true)
-	msg = WriteByte(msg, 128)
-	offset := 0
-	aaa := ReadUInt32(msg, &offset)
-	bbb := ReadString(msg, &offset)
-	ccc := ReadBool(msg, &offset)
-	ddd := ReadByte(msg, &offset)
-	fmt.Println("Init", len(msg), msg, aaa, bbb, ccc, ddd)
+
 }
 
 func (s *Server)Start() {
+
+    // connect sql
+    //TODO:close connect on program terminate, where is the callback? ask json?
+    var (
+        userName string = "root"
+        password string = "super789987"
+        ip string = "127.0.0.1"
+        port int = 3306
+        dbName string = "YouBuildIPlay"
+        charset string = "utf8"
+    )
+    dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s", userName, password, ip, port, dbName, charset)
+    db, err := sqlx.Open("mysql", dsn)
+    if err != nil {
+        fmt.Println("connect mysql fail:", err.Error())
+        s.db = nil
+        return
+    } else {
+        fmt.Println("connect mysql success")
+        s.db = db
+    }
+
+    // init global vars
+    globalTable := &GlobalTable{}
+    err = s.db.Get(globalTable, "select * from Global")
+    if err != nil {
+        fmt.Println("db connection is damaged!", err)
+        return
+    }
+    s.maxMapId = globalTable.MaxMapId
+    s.maxBattleId = globalTable.MaxBattleId
+
+    // main tick
 	go s.TickCoroutine()
 
+    // listening connection
 	http.HandleFunc("/", s.HandleNewConnection)
 	fmt.Println("server started, listening 127.0.0.1:30000...")
 	http.ListenAndServe("127.0.0.1:30000", nil)
@@ -195,7 +224,7 @@ type Player struct {
 func (p *Player) Init() {
 
 	// start read goroutine
-	p.readMsgs = make(chan []byte, 1024)
+	p.readMsgs = make(chan []byte, 32)
 	go p.ReadMsgCoroutine()
 	p.disconnect = false
 
@@ -521,7 +550,6 @@ func (b *Battle)BattleEnd(bWin bool) {
 	frameDataHead = WriteUInt32(frameDataHead, b.currFrameIndex)
 	b.frameDataRecord = append(frameDataHead, b.frameDataRecord...)
 
-	//TODO: should not use battleId as filename, because battleId may reset
 	// save frameDataRecord to file. then client can replay this battle
 	ioutil.WriteFile(fmt.Sprintf("./BattleReord/%d", b.battleId), b.frameDataRecord, 0666)
 
@@ -555,6 +583,38 @@ func (b *Battle)BattleEnd(bWin bool) {
 	}
 }
 
+///////////////////////////
+// sql table define
+// operation helper:
+// insert db.Exec("insert into tablename values(?,?)", v1, v2)
+// delete db.Exec("delete from tablename where id = ")
+// update db.Exec("update tablename set columnname = v where id = ")
+// get db.Get(*TableDefine, "select * from tablename where id = ") 
+// select db.Select([]TableDefine, "select * from tablename where id = ")
+///////////////////////////
+type GlobalTable struct {
+    MaxMapId uint32 `db:"maxMapId"`
+    MaxBattleId uint32 `db:"maxBattleId"`
+}
+
+type PlayerTable struct {
+    PlayerId uint32 `db:"playerId"`
+}
+
+type MapTable struct {
+    MapId uint32 `db:"mapId"`
+    LikeNum uint32 `db:"likeNum"`
+}
+
+type BattleTable struct {
+    BattleId uint32 `db:"battleId"` 
+    MapId uint32 `db:"mapId"`
+    PlayTime string `db:"playTime"`
+    PlayerId1 uint32 `db:"playerId1"`
+    PlayerId2 uint32 `db:"playerId2"`
+    PlayerId3 uint32 `db:"playerId3"`
+    PlayerId4 uint32 `db:"playerId4"`
+}
 
 ////////////////////////////
 // Message parse
