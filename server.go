@@ -117,7 +117,6 @@ func (s *Server)HandleNewConnection(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    fmt.Println("come a new connection")
     player := &Player{conn: conn}
     player.Init()
     s.newPlayerChan <- player
@@ -194,12 +193,14 @@ func (s *Server)Tick(deltaTime float32) {
             offset := 0
             name := ReadString(msg, &offset)
             if name == "Login" {
+                fmt.Println(msg, len(msg))
                 // remove from server and put to lobby
                 player.playerId = ReadUInt32(msg, &offset)
                 player.playerName = ReadString(msg, &offset)
                 s.lobby.players[player.playerId] = player
                 s.playersNoLogin = append(s.playersNoLogin[:i], s.playersNoLogin[i+1:]...)
                 i--
+                fmt.Println("player login", player.playerId, player.playerName)
                 break
             }
 
@@ -234,6 +235,8 @@ type Player struct {
 }
 
 func (p *Player) Init() {
+
+    fmt.Println("come a new connection")
 
     // start read goroutine
     p.readMsgs = make(chan []byte, 32)
@@ -294,10 +297,10 @@ func (p *Player) OnReceiveMapPartData(mapPartData []byte) {
 
         // check end, send upload result
         sendMsg := make([]byte, 0, 32)
-        WriteString(sendMsg, "UploadMapRespone")
-        WriteBool(sendMsg, checkMd5Success)
+        sendMsg = WriteString(sendMsg, "UploadMapRespone")
+        sendMsg = WriteBool(sendMsg, checkMd5Success)
         if !checkMd5Success {
-            WriteString(sendMsg, "Md5CheckFail")
+            sendMsg = WriteString(sendMsg, "Md5CheckFail")
         }
         p.SendMsg(sendMsg)
 
@@ -334,9 +337,9 @@ func (p *Player) SendFileCoroutine(filePath string, msgName string) {
     fileData, err := ioutil.ReadFile(filePath)
     if err != nil {
         responeMsg := make([]byte, 0, 32)
-        WriteString(responeMsg, fmt.Sprintf("%sHead", msgName))
-        WriteBool(responeMsg, false)
-        WriteString(responeMsg, "RequestFileMissing??")
+        responeMsg = WriteString(responeMsg, fmt.Sprintf("%sHead", msgName))
+        responeMsg = WriteBool(responeMsg, false)
+        responeMsg = WriteString(responeMsg, "RequestFileMissing??")
         p.SendMsg(responeMsg)
         return
     }
@@ -355,13 +358,13 @@ func (p *Player) SendFileCoroutine(filePath string, msgName string) {
         remainSendSize := 1024
 
         if bHead {
-            WriteString(responeMsg, fmt.Sprintf("%sHead", msgName))
-            WriteBool(responeMsg, true)
-            WriteUInt32(responeMsg, uint32(fileSize))
-            WriteByteArray(responeMsg, fileMd5)
+            responeMsg = WriteString(responeMsg, fmt.Sprintf("%sHead", msgName))
+            responeMsg = WriteBool(responeMsg, true)
+            responeMsg = WriteUInt32(responeMsg, uint32(fileSize))
+            responeMsg = WriteByteArray(responeMsg, fileMd5)
             remainSendSize = 1024 - len(responeMsg)
         } else {
-            WriteString(responeMsg, fmt.Sprintf("%sBody", msgName))
+            responeMsg = WriteString(responeMsg, fmt.Sprintf("%sBody", msgName))
         }
 
         remainSendSize -= 2 // 2 byte respone to the size of part data
@@ -433,11 +436,11 @@ func (l *Lobby) Tick(deltaTime float32) {
                 // notify player enter room
                 // fmt: EnterRoom|playerNum|playerId1|playerId2|...
                 msg := make([]byte, 0, 32)
-                WriteString(msg, "EnterRoom")
-                WriteUInt32(msg, newRoom.roomId)
-                WriteUInt32(msg, newRoom.mapId)
-                WriteUInt32(msg, 1)
-                WriteUInt32(msg, player.playerId)
+                msg = WriteString(msg, "EnterRoom")
+                msg = WriteUInt32(msg, newRoom.roomId)
+                msg = WriteUInt32(msg, newRoom.mapId)
+                msg = WriteUInt32(msg, 1)
+                msg = WriteUInt32(msg, player.playerId)
                 player.SendMsg(msg)
 
                 continue
@@ -454,10 +457,10 @@ func (l *Lobby) Tick(deltaTime float32) {
                     // notify all player that a new menber come in
                     // fmt: EnterRoom|roomId|mapId|playerNum|playerId1|playerId2|...
                     msg := make([]byte, 0, 32)
-                    WriteString(msg, "EnterRoom")
-                    WriteUInt32(msg, room.roomId)
-                    WriteUInt32(msg, room.mapId)
-                    WriteUInt32(msg, uint32(len(room.players)))
+                    msg = WriteString(msg, "EnterRoom")
+                    msg = WriteUInt32(msg, room.roomId)
+                    msg = WriteUInt32(msg, room.mapId)
+                    msg = WriteUInt32(msg, uint32(len(room.players)))
                     for i := 0; i < len(room.players); i++ {
                         WriteUInt32(msg, room.players[i].playerId)
                     }
@@ -487,8 +490,8 @@ func (l *Lobby) Tick(deltaTime float32) {
 
                 // append head, and send
                 responeMsgHead := make([]byte, 0, 32)
-                WriteString(responeMsgHead, "ResponePlayersInfo")
-                WriteUInt32(responeMsgHead, responePlayerNum)
+                responeMsgHead = WriteString(responeMsgHead, "ResponePlayersInfo")
+                responeMsgHead = WriteUInt32(responeMsgHead, responePlayerNum)
                 responeMsg = append(responeMsgHead, responeMsg...)
                 player.SendMsg(responeMsg)
 
@@ -502,9 +505,9 @@ func (l *Lobby) Tick(deltaTime float32) {
                 if player.mapExpectSize >= 1024 * 1024 * 10 {
                     player.mapExpectSize = 0
                     sendMsg := make([]byte, 0, 32)
-                    WriteString(sendMsg, "UploadMapRespone")
-                    WriteBool(sendMsg, false)
-                    WriteString(sendMsg, "SizeTooBig")
+                    sendMsg = WriteString(sendMsg, "UploadMapRespone")
+                    sendMsg = WriteBool(sendMsg, false)
+                    sendMsg = WriteString(sendMsg, "SizeTooBig")
                     player.SendMsg(sendMsg)
                     continue
                 }
@@ -614,10 +617,10 @@ func (r *Room) Tick(delta float32) {
                     // notify players enter a battle
                     // msg format: battleId|mapId|playerNum|playerid1|playerid2|...
                     msg := make([]byte, 0, 32)
-                    WriteString(msg, "EnterBattle")
-                    WriteUInt32(msg, newBattle.battleId)
-                    WriteUInt32(msg, r.mapId)
-                    WriteUInt32(msg, uint32(playerNum))
+                    msg = WriteString(msg, "EnterBattle")
+                    msg = WriteUInt32(msg, newBattle.battleId)
+                    msg = WriteUInt32(msg, r.mapId)
+                    msg = WriteUInt32(msg, uint32(playerNum))
                     for j := 0; j < playerNum; j++ {
                         WriteUInt32(msg, r.players[j].playerId)
                     }
@@ -641,7 +644,6 @@ func (r *Room) Tick(delta float32) {
         }
     }
 }
-
 
 ////////////////////////////
 // multi client play a level, use frame lock sync, come from room
@@ -804,12 +806,12 @@ func (b *Battle)BattleEnd(bWin bool) {
     // motify players enter room
     // fmt: EnterRoom|roomId|mapId|playerNum|playerId1|playerId2|...
     msg := make([]byte, 0, 32)
-    WriteString(msg, "EnterRoom")
-    WriteUInt32(msg, newRoom.roomId)
-    WriteUInt32(msg, newRoom.mapId)
-    WriteUInt32(msg, uint32(playerNum))
+    msg = WriteString(msg, "EnterRoom")
+    msg = WriteUInt32(msg, newRoom.roomId)
+    msg = WriteUInt32(msg, newRoom.mapId)
+    msg = WriteUInt32(msg, uint32(playerNum))
     for i := 0; i < playerNum; i++ {
-        WriteUInt32(msg, newRoom.players[i].playerId)
+        msg = WriteUInt32(msg, newRoom.players[i].playerId)
     }
     for i := 0; i < playerNum; i++ {
         newRoom.players[i].SendMsg(msg)
