@@ -304,6 +304,7 @@ func (p *Player) OnReceiveMapPartData(mapPartData []byte) {
         if checkMd5Success {
 
             // save map to file
+            // client should zip the file
             s.maxMapId++
             newMapId := s.maxMapId
             ioutil.WriteFile(fmt.Sprintf("./maps/%d", newMapId), p.mapPartDataCache, 0666)
@@ -326,7 +327,7 @@ func (p *Player) OnReceiveMapPartData(mapPartData []byte) {
     }
 }
 
-//TODO: file size too big will cause server lag, so create a thread to do this
+// file size too big will cause server lag, so create a thread to do this
 func (p *Player) SendFileCoroutine(filePath string, msgName string) {
 
     // file not exist?
@@ -782,6 +783,7 @@ func (b *Battle)BattleEnd(bWin bool) {
     b.replayData = append(replayDataHead, b.replayData...)
 
     // save replayData to file. then client can replay this battle
+    // TODO: zip the file, they are huge continue frameData are same
     ioutil.WriteFile(fmt.Sprintf("./battleReplay/%d", b.battleId), b.replayData, 0666)
 
     // create a new room
