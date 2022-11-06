@@ -6,6 +6,7 @@ import (
     "math"
     "bufio"
     "os"
+    "crypto/md5"
     "fmt"
     "flag"
     "net/url"
@@ -36,16 +37,35 @@ func main() {
 
             offset := 0
             name := ReadString(msg, &offset)
-            fmt.Println("name:", name)
+
             if name == "LoginRespone" {
                 success := ReadBool(msg, &offset)
-                fmt.Println("args:%t", success)
+                fmt.Println(name, success)
+                continue
+            }
+
+            if name == "UploadMapRespone" {
+                success := ReadBool(msg, &offset)
+                failReason := ""
+                if !success {
+                    failReason = ReadString(msg, &offset)
+                }
+                fmt.Println(name, success, failReason)
+                continue
+            }
+
+            if name == "UpdateRoomState" {
+                roomId := ReadUInt32(msg, &offset)
+                mapId := ReadUInt32(msg, &offset)
+                playerNum := ReadUInt32(msg, &offset)
+                playerId := ReadUInt32(msg, &offset)
+                fmt.Println(name, roomId, mapId, playerNum, playerId)
                 continue
             }
         }
     }()
 
-    // read cmommand line input
+    // read cmommand line input, simulate send msg
     for {
         reader := bufio.NewReader(os.Stdin)
         input, err := reader.ReadString('\n')
@@ -57,13 +77,43 @@ func main() {
         if input == "Login\n" {
             msg := make([]byte, 0, 32)
             msg = WriteString(msg, "Login")
-            msg = WriteUInt32(msg, uint32(11111))
+            msg = WriteUInt32(msg, uint32(2222))
             msg = WriteString(msg, "jasonszheng")
             err := conn.WriteMessage(websocket.TextMessage, msg)
             if err != nil {
                 fmt.Println(err)
             }
             continue
+        }
+
+        if input == "UploadMapHead\n" {
+            fileData := []byte("aaaabbbbccccdddd")
+            fileMd5Array := md5.Sum(fileData)
+            fileMd5 := make([]byte, 16)
+            copy(fileMd5, fileMd5Array[:])
+
+            msg := make([]byte, 0, 32)
+            msg = WriteString(msg, "UploadMapHead")
+            msg = WriteUInt32(msg, uint32(len(fileData)))
+            msg = WriteByteArray(msg, fileMd5)
+            msg = WriteByteArray(msg, fileData)
+
+            err := conn.WriteMessage(websocket.TextMessage, msg)
+            if err != nil {
+                fmt.Println(err)
+            }
+            continue
+        }
+
+        if input == "CreateRoom\n" {
+            msg := make([]byte, 0, 32)
+            msg = WriteString(msg, "CreateRoom")
+            msg = WriteUInt32(msg, uint32(6))
+
+            err := conn.WriteMessage(websocket.TextMessage, msg)
+            if err != nil {
+                fmt.Println(err)
+            }
         }
     }
 }
@@ -79,7 +129,6 @@ func ReadByteArray(data []byte, offset *int) []byte {
     length <<= 8
     length |= uint16(data[*offset])
     *offset += 2
-    fmt.Println(length)
 
     // read string
     result := data[*offset : *offset+int(length)]
@@ -129,7 +178,6 @@ func WriteFloat64(data []byte, flt float64) []byte {
 }
 
 func ReadUInt32(data []byte, offset *int) uint32 {
-    fmt.Println(*offset)
     // 4 byte
     var value uint32 = 0
     for i := 3; i >= 0; i-- {
