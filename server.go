@@ -178,6 +178,14 @@ func (s *Server)Tick(deltaTime float32) {
     // handle player login
     for i := 0; i < len(s.playersNoLogin); i++ {
         player := s.playersNoLogin[i]
+
+        // remove the player
+        if player.conn == nil {
+            s.playersNoLogin = append(s.playersNoLogin[:i], s.playersNoLogin[i+1:]...)
+            i--
+            continue
+        }
+
         for {
             bNoNewMsg := false
             var msg []byte
@@ -193,17 +201,24 @@ func (s *Server)Tick(deltaTime float32) {
             offset := 0
             name := ReadString(msg, &offset)
             if name == "Login" {
-                fmt.Println(msg, len(msg))
-                // remove from server and put to lobby
-                player.playerId = ReadUInt32(msg, &offset)
-                player.playerName = ReadString(msg, &offset)
-                s.lobby.players[player.playerId] = player
+
+                // remove from server, and put to lobby
                 s.playersNoLogin = append(s.playersNoLogin[:i], s.playersNoLogin[i+1:]...)
                 i--
-                fmt.Println("player login", player.playerId, player.playerName)
+
+                playerId := ReadUInt32(msg, &offset)
+                playerName := ReadString(msg, &offset)
+
+                // check the player is already exist in lobby/battle ? replace player with exist player
+                existPlayer, exist := s.lobby.players[playerId]
+                if exist {
+                    existPlayer.conn = player.conn
+                    player = existPlayer
+                }
+
+                player.Login(playerId, playerName)
                 break
             }
-
         }
     }
 }
@@ -220,7 +235,6 @@ type Player struct {
     sendMutex sync.Mutex
 
     conn* websocket.Conn
-    disconnect bool
 
     roomId uint32
     battleId uint32
@@ -241,7 +255,6 @@ func (p *Player) Init() {
     // start read goroutine
     p.readMsgs = make(chan []byte, 32)
     go p.ReadMsgCoroutine()
-    p.disconnect = false
 
     // 0 means not in room or battle
     p.roomId = 0
@@ -259,8 +272,8 @@ func (p *Player) ReadMsgCoroutine() {
         _ , msg, err := p.conn.ReadMessage()
         if err != nil {
             fmt.Println("player disconnect", p.playerId, err)
-            p.disconnect = true
-            //TODO kick off lobby/room/battle
+            p.conn.Close()
+            p.conn = nil
             return
         }
         fmt.Printf("receive from:%s message: %s\n", p.conn.RemoteAddr(), string(msg))
@@ -269,9 +282,51 @@ func (p *Player) ReadMsgCoroutine() {
 }
 
 func (p *Player) SendMsg(msg []byte) {
+    if p.conn == nil {
+        return
+    }
     p.sendMutex.Lock()
     p.conn.WriteMessage(websocket.TextMessage, msg)
     p.sendMutex.Unlock()
+}
+
+func (p *Player) Login(inPlayerId uint32, inPlayerName string) {
+
+    fmt.Println("player login", inPlayerId, inPlayerName)
+    s := GetServerInstance()
+
+    // send success respone
+    responeMsg := make([]byte, 0, 32)
+    responeMsg = WriteString(responeMsg, "LoginRespone")
+    responeMsg = WriteBool(responeMsg, true)
+    p.SendMsg(responeMsg)
+
+    // reconnect to the battle
+    if p.battleId > 0 {
+        fmt.Println("player reconnect to battle", inPlayerId, p.battleId)
+        battle, exist := s.battles[p.battleId]
+        if exist {
+            battle.OnPlayerReconnectToBattle(p)
+            return
+        }
+    }
+
+    p.playerId = inPlayerId
+    p.playerName = inPlayerName
+    s.lobby.players[p.playerId] = p
+
+    playerTable := &PlayerTable{}
+    err := s.db.Get(playerTable, "select * from Player where playerId=?", p.playerId) 
+    if err != nil {
+        fmt.Println(err)
+
+        // not exist, insert a new record
+        _, err1 := s.db.Exec("insert into Player values(?,?)", inPlayerId, inPlayerName)
+        if err1 != nil {
+            fmt.Println(err1)
+        }
+    }
+
 }
 
 func (p *Player) OnReceiveMapPartData(mapPartData []byte) {
@@ -406,6 +461,16 @@ func (l *Lobby) Tick(deltaTime float32) {
     s := GetServerInstance()
     for _, player := range l.players {
 
+        // handle disconnect, remove it, but in battle? we should keep it
+        // if player login again, and the battle still exist, reconnect the player to battle
+        // if battle end, the player still offline, we will delete the player from lobby
+        if player.conn == nil {
+            if player.battleId == 0 {
+                delete(l.players, player.playerId)
+            }
+            continue
+        }
+
         for {
             bNoNewMsg := false
             var msg []byte
@@ -427,21 +492,14 @@ func (l *Lobby) Tick(deltaTime float32) {
                 s.maxRoomId++
                 newRoom := &Room{s.maxRoomId, mapId, nil}
                 newRoom.Init()
-
-                // enter room
-                player.roomId = newRoom.roomId
-                newRoom.players = append(newRoom.players, player)
                 s.rooms[newRoom.roomId] = newRoom
 
+                // player enter room
+                player.roomId = newRoom.roomId
+                newRoom.players = append(newRoom.players, player)
+
                 // notify player enter room
-                // fmt: EnterRoom|playerNum|playerId1|playerId2|...
-                msg := make([]byte, 0, 32)
-                msg = WriteString(msg, "EnterRoom")
-                msg = WriteUInt32(msg, newRoom.roomId)
-                msg = WriteUInt32(msg, newRoom.mapId)
-                msg = WriteUInt32(msg, 1)
-                msg = WriteUInt32(msg, player.playerId)
-                player.SendMsg(msg)
+                newRoom.NotifyAllPlayersRoomState()
 
                 continue
             }
@@ -455,18 +513,7 @@ func (l *Lobby) Tick(deltaTime float32) {
                     room.players = append(room.players, player)
 
                     // notify all player that a new menber come in
-                    // fmt: EnterRoom|roomId|mapId|playerNum|playerId1|playerId2|...
-                    msg := make([]byte, 0, 32)
-                    msg = WriteString(msg, "EnterRoom")
-                    msg = WriteUInt32(msg, room.roomId)
-                    msg = WriteUInt32(msg, room.mapId)
-                    msg = WriteUInt32(msg, uint32(len(room.players)))
-                    for i := 0; i < len(room.players); i++ {
-                        WriteUInt32(msg, room.players[i].playerId)
-                    }
-                    for i := 0; i < len(room.players); i++ {
-                        room.players[i].SendMsg(msg)
-                    }
+                    room.NotifyAllPlayersRoomState()
                 }
                 continue
             }
@@ -572,15 +619,46 @@ func (r *Room) Init() {
     if r.players == nil {
         r.players = make([]*Player, 0, 4)
     }
+}
 
+func (r *Room) NotifyAllPlayersRoomState() {
+
+    // fmt: EnterRoom|roomId|mapId|playerNum|playerId1|playerId2|...
+    msg := make([]byte, 0, 32)
+    msg = WriteString(msg, "EnterRoom")
+    msg = WriteUInt32(msg, r.roomId)
+    msg = WriteUInt32(msg, r.mapId)
+    msg = WriteUInt32(msg, uint32(len(r.players)))
+    for i := 0; i < len(r.players); i++ {
+        msg = WriteUInt32(msg, r.players[i].playerId)
+    }
+    for i := 0; i < len(r.players); i++ {
+        r.players[i].SendMsg(msg)
+    }
 }
 
 func (r *Room) Tick(delta float32) {
 
-    playerNum := len(r.players)
     s := GetServerInstance()
-    for i := 0; i < playerNum; i++ {
+    for i := 0; i < len(r.players); i++ {
         player := r.players[i]
+
+        // handle disconnect
+        if player.conn == nil {
+
+            // player remove from room
+            r.players = append(r.players[:i], r.players[i+1:]...)
+            i--
+
+            // dismiss room if empty
+            if len(r.players) == 0 {
+                delete(s.rooms, r.roomId)
+                return
+            } else {
+                r.NotifyAllPlayersRoomState()
+            }
+            continue
+        }
 
         for {
             bNoNewMsg := false
@@ -608,7 +686,7 @@ func (r *Room) Tick(delta float32) {
                     // dismiss room, players enter battle, and start a new battle
                     delete(s.rooms, r.roomId)
                     s.battles[newBattle.battleId] = newBattle
-                    for j := 0; j < playerNum; j++ {
+                    for j := 0; j < len(r.players); j++ {
                         player := r.players[j]
                         player.roomId = 0
                         player.battleId = newBattle.battleId
@@ -620,25 +698,42 @@ func (r *Room) Tick(delta float32) {
                     msg = WriteString(msg, "EnterBattle")
                     msg = WriteUInt32(msg, newBattle.battleId)
                     msg = WriteUInt32(msg, r.mapId)
-                    msg = WriteUInt32(msg, uint32(playerNum))
-                    for j := 0; j < playerNum; j++ {
-                        WriteUInt32(msg, r.players[j].playerId)
+                    msg = WriteUInt32(msg, uint32(len(r.players)))
+                    for j := 0; j < len(r.players); j++ {
+                        msg = WriteUInt32(msg, r.players[j].playerId)
                     }
-                    for j := 0; j < playerNum; j++ {
+                    for j := 0; j < len(r.players); j++ {
                         r.players[j].SendMsg(msg)
                     }
 
-                    continue
+                    return
                 }
+
                 if name == "KickPlayer" {
                     continue
                 }
+
                 if name == "DismissRoom" {
                     continue
                 }
             }
 
             if name == "Chat" {
+                continue
+            }
+
+            if name == "ExistRoom" {
+                // player remove from room
+                r.players = append(r.players[:i], r.players[i+1:]...)
+                i--
+
+                // dismiss room
+                if len(r.players) == 0 {
+                    delete(s.rooms, r.roomId)
+                    return
+                } else {
+                    r.NotifyAllPlayersRoomState()
+                }
                 continue
             }
         }
@@ -716,11 +811,33 @@ func (b *Battle) Tick(delta float32) {
 
     playerNum := len(b.players)
 
-    // pase client message
+    // all players are disconnect? the battle should end immediatly
+    bAllPlayersDisconnect := true
+    for i := 0; i < playerNum; i++ {
+        if b.players[i].conn != nil {
+            bAllPlayersDisconnect = false
+            break
+        }
+    }
+    if bAllPlayersDisconnect {
+        b.BattleEnd(false)
+        return
+    }
+
+    // client message
     bReceiveEnd := false
     bWin := false
     for i := 0; i < playerNum; i++ {
         player := b.players[i]
+
+        // player disconnect, but we should not remove it from the battle
+        // first reason is to keep relayData format valid
+        // second reason is we support player reconnect to this battle
+        if player.conn == nil {
+            // reset frameData to zero, like reset a pressing button
+            b.currFrameData[i] = 0
+            continue
+        }
 
         for {
             bNoNewMsg := false
@@ -771,6 +888,7 @@ func (b *Battle) Tick(delta float32) {
 }
 
 func (b *Battle)BattleEnd(bWin bool) {
+    s := GetServerInstance()
 
     // generate replayData 
     playerNum := len(b.players)
@@ -788,33 +906,79 @@ func (b *Battle)BattleEnd(bWin bool) {
     // TODO: zip the file, they are huge continue frameData are same
     ioutil.WriteFile(fmt.Sprintf("./battleReplay/%d", b.battleId), b.replayData, 0666)
 
+    // dismiss battle
+    delete(s.battles, b.battleId)
+
+    // check exist online player num
+    onlinePlayers := make([]*Player, 0)
+    for i := 0; i < playerNum; i++ {
+        if b.players[i].conn == nil {
+            // player still exist in lobby, remove it here
+            delete(s.lobby.players, b.players[i].playerId)
+        } else {
+            onlinePlayers = append(onlinePlayers, b.players[i])
+        }
+    }
+    if len(onlinePlayers) == 0 {
+        return
+    }
+
     // create a new room
-    s := GetServerInstance()
     s.maxRoomId++
-    newRoom := &Room{s.maxRoomId, b.mapId, b.players}
+    newRoom := &Room{s.maxRoomId, b.mapId, onlinePlayers}
     newRoom.Init()
 
-    // send player back to room, and dismiss battle
+    // send players back to room
     s.rooms[newRoom.roomId] = newRoom
-    delete(s.battles, b.battleId)
     for i := 0; i < len(newRoom.players); i++ {
         player := newRoom.players[i]
         player.battleId = 0
         player.roomId = newRoom.roomId
     }
+    newRoom.NotifyAllPlayersRoomState()
+}
 
-    // motify players enter room
-    // fmt: EnterRoom|roomId|mapId|playerNum|playerId1|playerId2|...
+func (b *Battle)OnPlayerReconnectToBattle(p *Player) {
+
+    // send enter battle
     msg := make([]byte, 0, 32)
-    msg = WriteString(msg, "EnterRoom")
-    msg = WriteUInt32(msg, newRoom.roomId)
-    msg = WriteUInt32(msg, newRoom.mapId)
-    msg = WriteUInt32(msg, uint32(playerNum))
-    for i := 0; i < playerNum; i++ {
-        msg = WriteUInt32(msg, newRoom.players[i].playerId)
+    msg = WriteString(msg, "EnterBattle")
+    msg = WriteUInt32(msg, b.battleId)
+    msg = WriteUInt32(msg, b.mapId)
+    msg = WriteUInt32(msg, uint32(len(b.players)))
+    for j := 0; j < len(b.players); j++ {
+        msg = WriteUInt32(msg, b.players[j].playerId)
     }
-    for i := 0; i < playerNum; i++ {
-        newRoom.players[i].SendMsg(msg)
+    p.SendMsg(msg)
+
+    // send relay data, break to many parts, to limit each package not exceed 1024 byte
+    totalSize := len(b.replayData)
+    sendSize := 0 // the size already send
+    bHead := true
+    for {
+        msg := make([]byte, 0, 1024)
+        if bHead {
+            msg = WriteString(msg, "ReconnectFrameDatasHead")
+            msg = WriteUInt32(msg, uint32(totalSize))
+        } else {
+            msg = WriteString(msg, "ReconnectFrameDatasBody")
+        }
+
+        partSendSize := 1024 - len(msg) - 2
+
+        bEnd := false
+        if sendSize + partSendSize > totalSize {
+            partSendSize = totalSize - sendSize
+            bEnd = true
+        }
+
+        msg = WriteByteArray(msg, b.replayData[sendSize : sendSize + partSendSize])
+        p.SendMsg(msg)
+        sendSize += partSendSize
+
+        if bEnd {
+            break
+        }
     }
 }
 
@@ -834,6 +998,7 @@ type GlobalTable struct {
 
 type PlayerTable struct {
     PlayerId uint32 `db:"playerId"`
+    PlayerName string `db:"playerName"`
 }
 
 type MapTable struct {

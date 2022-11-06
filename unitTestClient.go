@@ -25,7 +25,25 @@ func main() {
     fmt.Println("connect success")
 
     // read msg
-    
+    go func() {
+        
+        for {
+            _ , msg, err := conn.ReadMessage()
+            if err != nil {
+                fmt.Println(err)
+                return
+            }
+
+            offset := 0
+            name := ReadString(msg, &offset)
+            fmt.Println("name:", name)
+            if name == "LoginRespone" {
+                success := ReadBool(msg, &offset)
+                fmt.Println("args:%t", success)
+                continue
+            }
+        }
+    }()
 
     // read cmommand line input
     for {
@@ -36,12 +54,11 @@ func main() {
             return
         }
 
-        if input == "login\n" {
+        if input == "Login\n" {
             msg := make([]byte, 0, 32)
             msg = WriteString(msg, "Login")
             msg = WriteUInt32(msg, uint32(11111))
             msg = WriteString(msg, "jasonszheng")
-            fmt.Println(msg, len(msg))
             err := conn.WriteMessage(websocket.TextMessage, msg)
             if err != nil {
                 fmt.Println(err)
