@@ -279,7 +279,7 @@ func (p *Player) ReadMsgCoroutine() {
     for {
         _ , msg, err := p.conn.ReadMessage()
         if err != nil {
-            fmt.Println(p.playerId, "disconnect", err)
+            fmt.Println(p.playerId, "Logout")
             p.conn.Close()
             p.conn = nil
             return
@@ -479,6 +479,11 @@ func (l *Lobby) Tick(deltaTime float32) {
             continue
         }
 
+        // message handle by battle/room
+        if player.battleId != 0 || player.roomId != 0 {
+            continue
+        }
+
         for {
             bNoNewMsg := false
             var msg []byte
@@ -545,6 +550,7 @@ func (l *Lobby) Tick(deltaTime float32) {
                 // player enter room
                 player.roomId = roomId
                 room.players = append(room.players, player)
+                fmt.Println(player.playerId, "move to room", roomId)
 
                 // notify all player that a new menber come in
                 room.NotifyAllPlayersRoomState()
@@ -793,6 +799,7 @@ type Battle struct {
 
 func (b *Battle) Init() {
 
+    fmt.Println("BattleStart", b.battleId)
     playerNum := len(b.players)
 
     // record whole battle frame datas, reserve a big size
@@ -840,9 +847,9 @@ func (b *Battle) Init() {
 
 func (b *Battle) Tick(delta float32) {
 
-    // max battle time 30min, why client not upload EndBattle?? force stop it
+    // max battle time 18000tick = 30min, why client not upload EndBattle?? force stop it
     b.tickCount++
-    if b.tickCount > 18000 {
+    if b.tickCount > 100 {
         b.BattleEnd(false)
         return
     }
@@ -926,6 +933,7 @@ func (b *Battle) Tick(delta float32) {
 }
 
 func (b *Battle)BattleEnd(bWin bool) {
+    fmt.Println("BattleEnd", b.battleId, bWin)
     s := GetServerInstance()
 
     // generate replayData 
@@ -960,6 +968,14 @@ func (b *Battle)BattleEnd(bWin bool) {
     }
     if len(onlinePlayers) == 0 {
         return
+    }
+
+    // send battle result
+    for i := 0; i < len(onlinePlayers); i++ {
+        responeMsg := make([]byte, 0, 32)
+        responeMsg = WriteString(responeMsg, "BattleEnd")
+        responeMsg = WriteBool(responeMsg, bWin)
+        onlinePlayers[i].SendMsg(responeMsg)
     }
 
     // create a new room

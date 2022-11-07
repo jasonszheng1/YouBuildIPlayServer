@@ -3,6 +3,8 @@
 package main
 
 import (
+    "strings"
+    "strconv"
     "math"
     "bufio"
     "os"
@@ -58,8 +60,45 @@ func main() {
                 roomId := ReadUInt32(msg, &offset)
                 mapId := ReadUInt32(msg, &offset)
                 playerNum := ReadUInt32(msg, &offset)
-                playerId := ReadUInt32(msg, &offset)
-                fmt.Println(name, roomId, mapId, playerNum, playerId)
+                playerIds := make([]uint32, 0)
+                for i := 0; i < int(playerNum); i++ {
+                    playerIds = append(playerIds, ReadUInt32(msg, &offset))
+                }
+                fmt.Println(name, roomId, mapId, playerNum, playerIds)
+                continue
+            }
+
+            if name == "JoinRoomRespone" {
+                success := ReadBool(msg, &offset)
+                failReason := ""
+                if !success {
+                    failReason = ReadString(msg, &offset)
+                }
+                fmt.Println(name, success, failReason)
+                continue
+            }
+
+            if name == "EnterBattle" {
+                battleId := ReadUInt32(msg, &offset)
+                roomId := ReadUInt32(msg, &offset)
+                playerNum := ReadUInt32(msg, &offset)
+                playerIds := make([]uint32, 0)
+                for i := 0; i < int(playerNum); i++ {
+                    playerIds = append(playerIds, ReadUInt32(msg, &offset))
+                }
+                fmt.Println(name, battleId, roomId, playerNum, playerIds)
+                continue
+            }
+
+            if name == "BroadcastFrameData" {
+                frameData := ReadByteArray(msg, &offset)
+                fmt.Println(name, frameData)
+                continue
+            }
+
+            if name == "BattleEnd" {
+                bWin := ReadBool(msg, &offset)
+                fmt.Println(name, bWin)
                 continue
             }
         }
@@ -74,11 +113,19 @@ func main() {
             return
         }
 
-        if input == "Login\n" {
+        input = input[:len(input)-1]
+        inputs := strings.Split(input, " ")
+        if len(inputs) == 0 {
+            inputs = append(inputs, input)
+        }
+
+
+        if inputs[0] == "Login" {
             msg := make([]byte, 0, 32)
             msg = WriteString(msg, "Login")
-            msg = WriteUInt32(msg, uint32(2222))
-            msg = WriteString(msg, "jasonszheng")
+            playerId, _ := strconv.Atoi(inputs[1])
+            msg = WriteUInt32(msg, uint32(playerId))
+            msg = WriteString(msg, inputs[2])
             err := conn.WriteMessage(websocket.TextMessage, msg)
             if err != nil {
                 fmt.Println(err)
@@ -86,7 +133,7 @@ func main() {
             continue
         }
 
-        if input == "UploadMapHead\n" {
+        if inputs[0] == "UploadMapHead" {
             fileData := []byte("aaaabbbbccccdddd")
             fileMd5Array := md5.Sum(fileData)
             fileMd5 := make([]byte, 16)
@@ -105,7 +152,7 @@ func main() {
             continue
         }
 
-        if input == "CreateRoom\n" {
+        if inputs[0] == "CreateRoom" {
             msg := make([]byte, 0, 32)
             msg = WriteString(msg, "CreateRoom")
             msg = WriteUInt32(msg, uint32(6))
@@ -114,6 +161,32 @@ func main() {
             if err != nil {
                 fmt.Println(err)
             }
+            continue
+        }
+
+        if inputs[0] == "JoinRoom" {
+
+            msg := make([]byte, 0, 32)
+            msg = WriteString(msg, inputs[0])
+            roomId, _ := strconv.Atoi(inputs[1])
+            msg = WriteUInt32(msg, uint32(roomId))
+
+            err := conn.WriteMessage(websocket.TextMessage, msg)
+            if err != nil {
+                fmt.Println(err)
+            }
+            continue
+        }
+
+        if inputs[0] == "StartBattle" {
+            msg := make([]byte, 0, 32)
+            msg = WriteString(msg, inputs[0])
+
+            err := conn.WriteMessage(websocket.TextMessage, msg)
+            if err != nil {
+                fmt.Println(err)
+            }
+            continue
         }
     }
 }
