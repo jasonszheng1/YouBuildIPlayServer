@@ -91,6 +91,12 @@ func (s *Server)Start() {
         fmt.Println("connect mysql success")
         s.db = db
     }
+    defer func() {
+        if s.db != nil {
+            s.db.Close()
+            fmt.Println("mysql close")
+        }
+    }()
 
     // init global vars
     globalTable := &GlobalTable{}
@@ -259,7 +265,6 @@ type Player struct {
 
 func (p *Player) Init() {
 
-
     // start read goroutine
     p.readMsgs = make(chan []byte, 32)
     go p.ReadMsgCoroutine()
@@ -276,12 +281,17 @@ func (p *Player) Init() {
 }
 
 func (p *Player) ReadMsgCoroutine() {
+
+    defer func() {
+        p.conn.Close()
+        p.conn = nil
+        fmt.Println(p.playerId, "connection close")
+    }()
+
     for {
         _ , msg, err := p.conn.ReadMessage()
         if err != nil {
             fmt.Println(p.playerId, "Logout")
-            p.conn.Close()
-            p.conn = nil
             return
         }
         p.readMsgs <- msg
