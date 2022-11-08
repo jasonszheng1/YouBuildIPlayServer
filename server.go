@@ -72,7 +72,6 @@ func (s *Server)Init() {
 func (s *Server)Start() {
 
     // connect sql
-    //TODO:close connect on program terminate, where is the callback? ask json?
     var (
         userName string = "root"
         password string = "super789987"
@@ -406,6 +405,7 @@ func (p *Player) OnReceiveMapPartData(mapPartData []byte) {
 func (p *Player) SendFileCoroutine(filePath string, msgName string) {
 
     // file not exist?
+    // TODO: if muti thread read the same file, is safe??
     fileData, err := ioutil.ReadFile(filePath)
     if err != nil {
         responeMsg := make([]byte, 0, 32)
@@ -425,6 +425,11 @@ func (p *Player) SendFileCoroutine(filePath string, msgName string) {
     bHead := true
     sendSize := 0
     for {
+
+        // player disconnect, stop send
+        if p.conn == nil {
+            return
+        }
 
         responeMsg := make([]byte, 0, 1024)
         remainSendSize := 1024
@@ -478,19 +483,15 @@ func (l *Lobby) Tick(deltaTime float32) {
     s := GetServerInstance()
     for _, player := range l.players {
 
-        // handle disconnect, remove it, but in battle? we should keep it
-        // if player login again, and the battle still exist, reconnect the player to battle
-        // if battle end, the player still offline, we will delete the player from lobby
-        if player.conn == nil {
-            if player.battleId == 0 {
-                delete(l.players, player.playerId)
-                fmt.Println(player.playerId, "remove from lobby")
-            }
+        // message handle by battle/room
+        if player.battleId != 0 || player.roomId != 0 {
             continue
         }
 
-        // message handle by battle/room
-        if player.battleId != 0 || player.roomId != 0 {
+        // handle player disconnect
+        if player.conn == nil {
+            delete(l.players, player.playerId)
+            fmt.Println(player.playerId, "remove from lobby")
             continue
         }
 
@@ -645,7 +646,7 @@ func (l *Lobby) Tick(deltaTime float32) {
 
             if name == "DownloadBattleReplay" {
                 battleId := ReadUInt32(msg, &offset)
-                filePath := fmt.Sprintf("./battleReplay/%d", battleId)
+                filePath := fmt.Sprintf("./battles/%d", battleId)
                 go player.SendFileCoroutine(filePath, "DownloadBattleReplayRespone")
                 continue
             }
@@ -693,8 +694,9 @@ func (r *Room) Tick(delta float32) {
         // handle disconnect
         if player.conn == nil {
 
-            // player remove from room
+            // player remove from room and lobby
             r.players = append(r.players[:i], r.players[i+1:]...)
+            delete(s.lobby.players, player.playerId)
             i--
 
             // dismiss room if empty
@@ -779,6 +781,8 @@ func (r *Room) Tick(delta float32) {
                 responeMsg := make([]byte, 0, 32)
                 responeMsg = WriteString(responeMsg, "ExistRoomRespone")
                 player.SendMsg(responeMsg)
+
+                player.roomId = 0
                 fmt.Println(player.playerId, "move to lobby")
 
                 // dismiss room
@@ -866,7 +870,7 @@ func (b *Battle) Tick(delta float32) {
 
     playerNum := len(b.players)
 
-    // all players are disconnect? the battle should end immediatly
+    // all players are disconnect? should i end the battle immediatlys?? or maybe allow player to reconnect, but battle will keep 30min if player nerver come back
     bAllPlayersDisconnect := true
     for i := 0; i < playerNum; i++ {
         if b.players[i].conn != nil {
@@ -960,7 +964,7 @@ func (b *Battle)BattleEnd(bWin bool) {
 
     // save replayData to file. then client can replay this battle
     // TODO: zip the file, they are huge continue frameData are same
-    ioutil.WriteFile(fmt.Sprintf("./battleReplay/%d", b.battleId), b.replayData, 0666)
+    ioutil.WriteFile(fmt.Sprintf("./battles/%d", b.battleId), b.replayData, 0666)
 
     // dismiss battle
     delete(s.battles, b.battleId)

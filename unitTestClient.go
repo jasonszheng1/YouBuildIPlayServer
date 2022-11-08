@@ -178,6 +178,17 @@ func main() {
             continue
         }
 
+        if inputs[0] == "ExistRoom" {
+            msg := make([]byte, 0, 32)
+            msg = WriteString(msg, inputs[0])
+
+            err := conn.WriteMessage(websocket.TextMessage, msg)
+            if err != nil {
+                fmt.Println(err)
+            }
+            continue
+        }
+
         if inputs[0] == "StartBattle" {
             msg := make([]byte, 0, 32)
             msg = WriteString(msg, inputs[0])
