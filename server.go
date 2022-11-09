@@ -207,15 +207,25 @@ func (s *Server)Tick(deltaTime float32) {
             }
 
             offset := 0
-            name := ReadString(msg, &offset)
+            name, ok := ReadString(msg, &offset)
+            if !ok {
+                continue
+            }
             if name == "Login" {
+
+                playerId, ok := ReadUInt32(msg, &offset)
+                if !ok {
+                    continue
+                }
+                playerName, ok := ReadString(msg, &offset)
+                if !ok {
+                    continue
+                }
 
                 // remove from server, and put to lobby
                 s.playersNoLogin = append(s.playersNoLogin[:i], s.playersNoLogin[i+1:]...)
                 i--
 
-                playerId := ReadUInt32(msg, &offset)
-                playerName := ReadString(msg, &offset)
 
                 // check the player is already exist in lobby/battle ? replace player with exist player
                 existPlayer, exist := s.lobby.players[playerId]
@@ -508,11 +518,17 @@ func (l *Lobby) Tick(deltaTime float32) {
             }
 
             offset := 0
-            name := ReadString(msg, &offset)
+            name, ok := ReadString(msg, &offset)
+            if !ok {
+                continue
+            }
             if name == "CreateRoom" {
 
                 // check mapId is exist
-                mapId := ReadUInt32(msg, &offset)
+                mapId, ok := ReadUInt32(msg, &offset)
+                if !ok {
+                    continue
+                }
                 count := 0
                 err := s.db.Get(&count, "select count(mapId) from Map where mapId=?", mapId)
                 if err != nil {
@@ -545,7 +561,10 @@ func (l *Lobby) Tick(deltaTime float32) {
             }
 
             if name == "JoinRoom" {
-                roomId := ReadUInt32(msg, &offset)
+                roomId, ok := ReadUInt32(msg, &offset)
+                if !ok {
+                    continue
+                }
                 room, exist := s.rooms[roomId]
 
                 // not exist
@@ -569,14 +588,29 @@ func (l *Lobby) Tick(deltaTime float32) {
             }
 
             if name == "GetPlayersInfo" {
-                responeMsg := make([]byte, 0, 32)
+
+                // parase message
+                requestPlayerNum, ok := ReadUInt32(msg, &offset)
+                if !ok {
+                    continue
+                }
+                requestPlayerIds := make([]uint32, 0, requestPlayerNum)
+                for i := 0; i < int(requestPlayerNum); i++ {
+                    playerId, ok := ReadUInt32(msg, &offset)
+                    if !ok {
+                        break
+                    }
+                    requestPlayerIds = append(requestPlayerIds, playerId)
+                }
+                if uint32(len(requestPlayerIds)) != requestPlayerNum {
+                    continue
+                }
 
                 // collect all request player infos
-                requestPlayerNum := ReadUInt32(msg, &offset)
+                responeMsg := make([]byte, 0, 32)
                 var responePlayerNum uint32 = 0
                 for i := 0; i < int(requestPlayerNum); i++ {
-                    playerId := ReadUInt32(msg, &offset)
-                    findPlayer, exist := l.players[playerId]
+                    findPlayer, exist := l.players[requestPlayerIds[i]]
                     if exist {
                         WriteUInt32(responeMsg, findPlayer.playerId)
                         WriteUInt32(responeMsg, findPlayer.battleId)
@@ -597,7 +631,20 @@ func (l *Lobby) Tick(deltaTime float32) {
 
             if name == "UploadMapHead" {
 
-                player.mapExpectSize = ReadUInt32(msg, &offset)
+                mapExpectSize, ok := ReadUInt32(msg, &offset)
+                if !ok {
+                    continue
+                }
+                mapExpectMd5, ok := ReadByteArray(msg, &offset)
+                if !ok {
+                    continue
+                }
+                mapPartData, ok := ReadByteArray(msg, &offset)
+                if !ok {
+                    continue
+                }
+
+                player.mapExpectSize = mapExpectSize
                 // a gaint file?? 10MB ?? not allow
                 if player.mapExpectSize >= 1024 * 1024 * 10 {
                     player.mapExpectSize = 0
@@ -610,13 +657,12 @@ func (l *Lobby) Tick(deltaTime float32) {
                 }
 
                 // head, reset player all map caches
-                player.mapExpectMd5 = ReadByteArray(msg, &offset)
+                player.mapExpectMd5 = mapExpectMd5
                 player.mapReceiveSize = 0
                 player.mapReceiveMd5 = md5.New()
                 player.mapPartDataCache = make([]byte, 0, player.mapExpectSize)
 
                 // handle map part data
-                mapPartData := ReadByteArray(msg, &offset)
                 player.OnReceiveMapPartData(mapPartData)
 
                 continue
@@ -630,7 +676,10 @@ func (l *Lobby) Tick(deltaTime float32) {
                 }
 
                 // handle map part data
-                mapPartData := ReadByteArray(msg, &offset)
+                mapPartData, ok := ReadByteArray(msg, &offset)
+                if !ok {
+                    continue
+                }
                 player.OnReceiveMapPartData(mapPartData)
 
                 continue
@@ -638,14 +687,22 @@ func (l *Lobby) Tick(deltaTime float32) {
 
             if name == "DownloadMap" {
 
-                mapId := ReadUInt32(msg, &offset)
+                mapId, ok := ReadUInt32(msg, &offset)
+                if !ok {
+                    continue
+                }
+
                 filePath := fmt.Sprintf("./maps/%d", mapId)
                 go player.SendFileCoroutine(filePath, "DownloadMapRespone")
                 continue
             }
 
             if name == "DownloadBattleReplay" {
-                battleId := ReadUInt32(msg, &offset)
+                battleId, ok := ReadUInt32(msg, &offset)
+                if !ok {
+                    continue
+                }
+
                 filePath := fmt.Sprintf("./battles/%d", battleId)
                 go player.SendFileCoroutine(filePath, "DownloadBattleReplayRespone")
                 continue
@@ -722,7 +779,10 @@ func (r *Room) Tick(delta float32) {
             }
 
             offset := 0
-            name := ReadString(msg, &offset)
+            name, ok := ReadString(msg, &offset)
+            if !ok {
+                continue
+            }
 
             // captain only msg
             if i == 0 {
@@ -911,18 +971,27 @@ func (b *Battle) Tick(delta float32) {
             }
 
             offset := 0
-            name := ReadString(msg, &offset)
+            name, ok := ReadString(msg, &offset)
+            if !ok {
+                continue
+            }
 
             // collect all client frame data
             if name == "UploadFrameData" {
                 // frameData can ref client 8 button press status
-                frameData := ReadByte(msg, &offset)
+                frameData, ok := ReadByte(msg, &offset)
+                if !ok {
+                    continue
+                }
                 b.currFrameData[i] = frameData
                 continue
             }
             if name == "EndBattle" {
+                bWin, ok = ReadBool(msg, &offset)
+                if !ok {
+                    continue
+                }
                 bReceiveEnd = true
-                bWin = ReadBool(msg, &offset)
                 continue
             }
         }
@@ -1092,9 +1161,12 @@ type BattleTable struct {
 ////////////////////////////
 // Message parse
 ////////////////////////////
-func ReadByteArray(data []byte, offset *int) []byte {
+func ReadByteArray(data []byte, offset *int) ([]byte, bool) {
 
     // read a string length, 2 bytes
+    if len(data) <= *offset + 1 {
+        return nil, false
+    }
     var length uint16 = 0
     length |= uint16(data[*offset + 1])
     length <<= 8
@@ -1102,9 +1174,12 @@ func ReadByteArray(data []byte, offset *int) []byte {
     *offset += 2
 
     // read string
+    if len(data) <= *offset+int(length) - 1 {
+        return nil, false
+    }
     result := data[*offset : *offset+int(length)]
     *offset += int(length)
-    return result
+    return result, true
 }
 
 func WriteByteArray(data []byte, byteArray []byte) []byte {
@@ -1117,16 +1192,21 @@ func WriteByteArray(data []byte, byteArray []byte) []byte {
     return append(data, byteArray...)
 }
 
-func ReadString(data []byte, offset *int) string {
-    return string(ReadByteArray(data, offset))
+func ReadString(data []byte, offset *int) (string, bool) {
+    bytes, ok := ReadByteArray(data, offset)
+    return string(bytes), ok
 }
 
 func WriteString(data []byte, str string) []byte {
     return WriteByteArray(data, []byte(str))
 }
 
-func ReadFloat64(data []byte, offset *int) float64 {
+func ReadFloat64(data []byte, offset *int) (float64, bool) {
+
     // use IEEE 754, 8 byte
+    if len(data) <= *offset + 7 {
+        return float64(0.0), false
+    }
     var bits uint64 = 0
     for i := 7; i >= 0; i-- {
         bits |= uint64(data[*offset + i])
@@ -1135,7 +1215,7 @@ func ReadFloat64(data []byte, offset *int) float64 {
         }
     }
     *offset += 8
-    return math.Float64frombits(bits)
+    return math.Float64frombits(bits), true
 }
 
 func WriteFloat64(data []byte, flt float64) []byte {
@@ -1148,8 +1228,11 @@ func WriteFloat64(data []byte, flt float64) []byte {
     return data
 }
 
-func ReadUInt32(data []byte, offset *int) uint32 {
+func ReadUInt32(data []byte, offset *int) (uint32, bool) {
     // 4 byte
+    if len(data) <= *offset + 3 {
+        return uint32(0), false
+    }
     var value uint32 = 0
     for i := 3; i >= 0; i-- {
         value |= uint32(data[*offset + i])
@@ -1158,7 +1241,7 @@ func ReadUInt32(data []byte, offset *int) uint32 {
         }
     }
     *offset += 4
-    return value
+    return value, true
 }
 
 func WriteUInt32(data []byte, intValue uint32) []byte {
@@ -1169,21 +1252,27 @@ func WriteUInt32(data []byte, intValue uint32) []byte {
     return data
 }
 
-func ReadByte(data []byte, offset *int) byte {
+func ReadByte(data []byte, offset *int) (byte, bool) {
+    if len(data) <= *offset {
+        return byte(0), false
+    }
     value := data[*offset]
     *offset += 1
-    return value
+    return value, true
 }
 
 func WriteByte(data []byte, intValue byte) []byte {
     return append(data, intValue)
 }
 
-func ReadBool(data []byte, offset *int) bool {
+func ReadBool(data []byte, offset *int) (bool, bool) {
     // 1 byte
+    if len(data) <= *offset {
+        return false, false
+    }
     var result bool = data[*offset] == 1
     *offset += 1
-    return result
+    return result, true
 }
 
 func WriteBool(data []byte, bValue bool) []byte {
